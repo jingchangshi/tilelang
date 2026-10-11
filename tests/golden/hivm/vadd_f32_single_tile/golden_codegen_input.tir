@@ -1,0 +1,43 @@
+# from tvm.script import ir as I
+# from tvm.script import tirx as T
+
+@I.ir_module
+class Module:
+    @T.prim_func
+    def main_kernel(A: T.handle("float32", "global"), B: T.handle("float32", "global"), C: T.handle("float32", "global")):
+        T.func_attr({"calling_conv": 2, "dyn_shared_memory_buf": T.int64(196608), "target": T.target({"keys": ["ascend"], "kind": "ascend", "launch_grid_only": True, "max_vector_bits": 64, "supports_kernel_status_return": False, "supports_vector_predicate": True, "tag": ""}), "thread_extent": {"blockIdx.x": 64}, "tirx.is_global_func": T.bool(True), "tirx.kernel_launch_params": ["blockIdx.x", "tirx.use_dyn_shared_memory"], "tirx.noalias": True, "tl.non_restrict_params": [], "tl.readonly_param_indices": [0, 1]})
+        bx = T.launch_thread("blockIdx.x", 64)
+        buf_dyn_shmem = T.alloc_buffer((T.int64(196608),), "uint8", scope="shared.dyn")
+        a = T.decl_buffer((16384,), data=buf_dyn_shmem.data, scope="shared.dyn")
+        b = T.decl_buffer((16384,), data=buf_dyn_shmem.data, scope="shared.dyn")
+        c = T.decl_buffer((16384,), data=buf_dyn_shmem.data, scope="shared.dyn")
+        with T.sblock("VECTOR", no_realize=True):
+            T.reads()
+            T.writes()
+            buf_dyn_shmem_1 = T.Buffer((1,), data=buf_dyn_shmem.data, scope="shared.dyn")
+            A_1 = T.Buffer((bx * 8192 + 1,), data=A)
+            T.ascend_copy_gm_to_ubuf(T.address_of(buf_dyn_shmem_1[0]), T.address_of(A_1[bx * 8192]), 0, 1, 32768, 0, 0, 0, 0, 32768, 32768)
+            buf_dyn_shmem_2 = T.Buffer((16385,), data=buf_dyn_shmem.data, scope="shared.dyn")
+            B_1 = T.Buffer((bx * 8192 + 1,), data=B)
+            T.ascend_copy_gm_to_ubuf(T.address_of(buf_dyn_shmem_2[16384]), T.address_of(B_1[bx * 8192]), 0, 1, 32768, 0, 0, 0, 0, 32768, 32768)
+            T.ascend_set_flag("MTE2_V", 0)
+            T.ascend_wait_flag("MTE2_V", 0)
+            with T.sblock("SIMD_VF", no_realize=True):
+                T.reads()
+                T.writes()
+                T.sblock_attr({"tl.vf_source_index": T.int64(0)})
+                T.attr("simdvf", "tl.simdvf_scope", 1)
+                mask: T.boolx256 = T.tl.simd.pset(32, "PAT_ALL")
+                for i in range(128):
+                    buf_dyn_shmem_3 = T.Buffer((i * 64 + 1,), data=buf_dyn_shmem.data, scope="shared.dyn")
+                    a_reg: T.float32x64 = T.tl.simd.vld(T.address_of(buf_dyn_shmem_3[i * 64]), "NORM")
+                    buf_dyn_shmem_4 = T.Buffer((i * 64 + 16384 + 1,), data=buf_dyn_shmem.data, scope="shared.dyn")
+                    b_reg: T.float32x64 = T.tl.simd.vld(T.address_of(buf_dyn_shmem_4[i * 64 + 16384]), "NORM")
+                    result: T.float32x64 = T.tl.simd.vadd(a_reg, b_reg, mask, "MODE_ZEROING")
+                    buf_dyn_shmem_5 = T.Buffer((i * 64 + 32768 + 1,), data=buf_dyn_shmem.data, scope="shared.dyn")
+                    T.tl.simd.vsts(T.address_of(buf_dyn_shmem_5[i * 64 + 32768]), result, mask, "NORM_B32")
+            T.ascend_set_flag("V_MTE3", 0)
+            T.ascend_wait_flag("V_MTE3", 0)
+            C_1 = T.Buffer((bx * 8192 + 1,), data=C)
+            buf_dyn_shmem_3 = T.Buffer((32769,), data=buf_dyn_shmem.data, scope="shared.dyn")
+            T.ascend_copy_ubuf_to_gm(T.address_of(C_1[bx * 8192]), T.address_of(buf_dyn_shmem_3[32768]), 0, 1, 32768, 4, 32768, 32768)

@@ -1,0 +1,29 @@
+{
+  "case": "vadd_f32_single_tile",
+  "input_boundary": "after _prepare_device_codegen_mod",
+  "target": "ascend",
+  "kernel": "main_kernel",
+  "dtype": "float32",
+  "N": 524288,
+  "num_cores": 64,
+  "elements_per_core": 8192,
+  "vector_lanes": 64,
+  "vector_iterations": 128,
+  "ub_arena_bytes": 196608,
+  "ub_offsets_f32": {
+    "a": 0,
+    "b": 16384,
+    "c": 32768
+  },
+  "sync_events": [
+    [
+      "MTE2_V",
+      0
+    ],
+    [
+      "V_MTE3",
+      0
+    ]
+  ],
+  "golden_sha256": "576fa7a37bcaf1748e387efbd26508652e2e4b18790fa21aea874a7b756c0fe5"
+}
