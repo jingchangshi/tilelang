@@ -9,6 +9,8 @@
  * (src/ascend/stubs/) so TileLang keeps no CANN build-time dependency.
  * The Ascend backend is Linux-only.
  */
+#include "ascend/hivm_prebuilt_identity.h"
+#include "ascend/runtime/acl_rt_types.h"
 #include "ascend/stubs/ascendcl.h"
 
 #include <tvm/ffi/extra/c_env_api.h>
@@ -38,6 +40,7 @@ namespace tvm {
 namespace ascend {
 
 using namespace tvm::runtime;
+using namespace tvm::tl::ascendcl;
 
 namespace {
 
@@ -47,7 +50,6 @@ using AclFuncHandle = void *;
 using AclStream = void *;
 
 constexpr AclError kAclSuccess = 0;
-constexpr int32_t kAclLaunchKernelAttrDynUbufSize = 2;
 constexpr size_t kAclArgMinAlignment = 4;
 constexpr size_t kAclArgBufferAlignment = 8;
 
@@ -310,27 +312,6 @@ ffi::Function PackFuncAclHostArgs(F function,
   return PackFuncAclHostArgs_<0>(std::move(function), std::move(plan));
 }
 
-union AclLaunchKernelAttrValue {
-  uint8_t schem_mode;
-  uint32_t dyn_ubuf_size;
-  uint32_t engine_type;
-  uint32_t block_dim_offset;
-  uint8_t is_block_task_prefetch;
-  uint8_t is_data_dump;
-  uint16_t timeout;
-  uint32_t reserved[4];
-};
-
-struct AclLaunchKernelAttr {
-  int32_t id;
-  AclLaunchKernelAttrValue value;
-};
-
-struct AclLaunchKernelCfg {
-  AclLaunchKernelAttr *attrs;
-  size_t num_attrs;
-};
-
 void CheckAcl(AclError result, const char *operation) {
   if (result == kAclSuccess) {
     return;
@@ -397,6 +378,13 @@ public:
       if (auto source = source_.Get("asc")) {
         return source.value();
       }
+      // BC-4: a module RESTORED by AscendModuleLoadFromBytes has an EMPTY
+      // source map, so the honest PREBUILT label is RECONSTRUCTED from the
+      // retained format token instead of being lost with the map. Nothing is
+      // invented for an "aibin" module: only the HIVM format has that origin.
+      if (hivm_prebuilt::FormatUsesVectorCoreLoader(fmt_)) {
+        return ffi::String(hivm_prebuilt::HivmPrebuiltSourceLabel());
+      }
     }
     return ffi::String();
   }
@@ -405,22 +393,23 @@ public:
     std::lock_guard<std::mutex> lock(mutex_);
     DeviceModule &device_module = device_modules_[device_id];
     if (device_module.binary == nullptr) {
+      // The loader policy is a property of THIS module, carried by its format
+      // token -- never by process-global state or an environment variable (goal
+      // section 5.4). The HIVM PREBUILT format takes the VECTOR_CORE branch
+      // just below and RETURNS, so the AscendC call is not reached for it.
+      // P3 measured the choices: options=nullptr -> DEVICE_FAULT (E0), and
+      // ENGINE_TYPE=AIV without the magic also DEVICE_FAULT (E2), while the
+      // VECTOR_CORE magic passes (E1/E3) -- so the magic is built, not the
+      // engine type (CR-LD-2).
+      if (hivm_prebuilt::FormatUsesVectorCoreLoader(fmt_)) {
+        LoadVectorCoreBinary(device_module);
+        return FinishFunctionLookup(device_module, name);
+      }
       CheckAcl(aclrtBinaryLoadFromData(code_.data(), code_.size(), nullptr,
                                        &device_module.binary),
                "aclrtBinaryLoadFromData");
     }
-
-    auto cached = device_module.functions.find(name);
-    if (cached != device_module.functions.end()) {
-      return cached->second;
-    }
-
-    AclFuncHandle function{nullptr};
-    CheckAcl(
-        aclrtBinaryGetFunction(device_module.binary, name.c_str(), &function),
-        "aclrtBinaryGetFunction");
-    device_module.functions.emplace(name, function);
-    return function;
+    return FinishFunctionLookup(device_module, name);
   }
 
 private:
@@ -429,10 +418,48 @@ private:
     std::unordered_map<std::string, AclFuncHandle> functions;
   };
 
+  // Resolve (and cache) the per-name ACL function handle once the device binary
+  // is loaded. Shared by the two loader branches so they cannot drift apart in
+  // how they look up a kernel.
+  AclFuncHandle FinishFunctionLookup(DeviceModule &device_module,
+                                     const std::string &name) {
+    auto cached = device_module.functions.find(name);
+    if (cached != device_module.functions.end()) {
+      return cached->second;
+    }
+    AclFuncHandle function{nullptr};
+    CheckAcl(
+        aclrtBinaryGetFunction(device_module.binary, name.c_str(), &function),
+        "aclrtBinaryGetFunction");
+    device_module.functions.emplace(name, function);
+    return function;
+  }
+
+  // Load an HIVM PREBUILT module with the VECTOR_CORE magic option (CR-LD-1).
+  // Kept out of GetFunctionHandle so that the existing AscendC loader call there
+  // stays textually intact (CR-LD-3(a)); the option storage is a member so it
+  // outlives the ACL call rather than being a stack local at the call site.
+  void LoadVectorCoreBinary(DeviceModule &device_module) {
+    load_option_.type = kAclBinaryLoadOptMagic;
+    load_option_.value.magic = kAclBinaryMagicElfVectorCore;
+    load_options_.options = &load_option_;
+    load_options_.numOpt = 1;
+    CheckAcl(aclrtBinaryLoadFromData(code_.data(), code_.size(), &load_options_,
+                                     &device_module.binary),
+             "aclrtBinaryLoadFromData");
+  }
+
   ffi::Bytes code_;
   ffi::String fmt_;
   ffi::Map<ffi::String, FunctionInfo> fmap_;
   ffi::Map<ffi::String, ffi::String> source_;
+
+  // The VECTOR_CORE loader option, built once per module and kept alive for the
+  // module's lifetime: the ACL call reads it synchronously, but the loader
+  // holds the pointer, so the storage must outlive the call rather than being a
+  // stack local in GetFunctionHandle. Only ever populated for the HIVM format.
+  AclBinaryLoadOption load_option_{};
+  AclBinaryLoadOptions load_options_{};
 
   std::mutex mutex_;
   std::unordered_map<int32_t, DeviceModule> device_modules_;
@@ -481,10 +508,10 @@ public:
     AclLaunchKernelCfg *config_ptr = nullptr;
     if (workload.dyn_shmem_size != 0) {
       attribute.id = kAclLaunchKernelAttrDynUbufSize;
-      attribute.value.dyn_ubuf_size =
+      attribute.value.dynUBufSize =
           static_cast<uint32_t>(workload.dyn_shmem_size);
       config.attrs = &attribute;
-      config.num_attrs = 1;
+      config.numAttrs = 1;
       config_ptr = &config;
     }
 
@@ -547,10 +574,20 @@ static ffi::Module AscendModuleLoadFromBytes(const ffi::Bytes &bytes) {
   stream.Read(&fmt);
   TVM_FFI_ICHECK(stream.Read(&fmap));
   stream.Read(&code);
-  TVM_FFI_CHECK(fmt == "aibin", RuntimeError)
+  // The format token is the loader-policy carrier, so a restored module selects
+  // the same loader the original did. "aibin" keeps its exact previous
+  // behaviour; the HIVM PREBUILT token is admitted alongside it. Anything else
+  // is still refused with the original message.
+  const std::string fmt_str = static_cast<std::string>(fmt);
+  TVM_FFI_CHECK(fmt_str == hivm_prebuilt::kAibinFormat ||
+                    fmt_str == hivm_prebuilt::kHivmPrebuiltFormat,
+                RuntimeError)
       << "Unsupported Ascend module format `" << fmt
       << "`. This is likely a legacy source-only cache entry; remove it and "
          "recompile.";
+  // The source map is intentionally empty here: the honest PREBUILT label is
+  // RECONSTRUCTED by InspectSource from the retained format token (BC-4),
+  // instead of being lost with the map.
   return AscendModuleCreate(std::move(code), std::move(fmt), std::move(fmap),
                             ffi::Map<ffi::String, ffi::String>());
 }
