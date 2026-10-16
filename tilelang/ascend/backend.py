@@ -1,8 +1,12 @@
-"""Ascend backend manifests (plain AscendC and PTO)."""
+"""Ascend backend manifests (plain AscendC, PTO and HIVM)."""
 
 from __future__ import annotations
 
-from tilelang.ascend.target import target_is_plain_ascend, target_is_pto
+from tilelang.ascend.target import (
+    target_is_hivm,
+    target_is_plain_ascend,
+    target_is_pto,
+)
 from tilelang.backend.host_codegen import STANDARD_HOST_CODEGENS
 from tilelang.backend.module import BackendModule, register_backend
 from tilelang.contrib import bisheng
@@ -74,5 +78,28 @@ PTO_BACKEND = register_backend(
         device_codegens={"ascend": codegen.PTO_CODEGEN},
         execution_backends=execution_backend.PTO_EXECUTION_BACKENDS,
         host_codegens=STANDARD_HOST_CODEGENS,
+    )
+)
+
+# The TEST_ONLY PREBUILT HIVM backend. It shares the "ascend" target kind and
+# is selected by the "hivm" key; its pipeline and device-codegen mappings stay
+# keyed by "ascend", and it reuses the existing host codegens. It opens
+# tvm_ffi only (goal req 9) and runs no AscendC/PTO/HIVM-MLIR codegen.
+#
+# cache_reusable=False (BC-1): this backend injects a device binary read from a
+# fixed PATH at build time, so a warm kernel-cache entry describes TIR that is
+# still correct while the injected bytes may have changed. The cache key does
+# not cover those bytes, so reuse is refused rather than trusted. Every other
+# backend keeps the default True.
+HIVM_BACKEND = register_backend(
+    BackendModule(
+        name="hivm",
+        target_kinds=("ascend",),
+        supports_target=target_is_hivm,
+        pipelines={"ascend": pipeline.ascend_pipeline},
+        device_codegens={"ascend": codegen.HIVM_CODEGEN},
+        execution_backends=execution_backend.HIVM_EXECUTION_BACKENDS,
+        host_codegens=STANDARD_HOST_CODEGENS,
+        cache_reusable=False,
     )
 )

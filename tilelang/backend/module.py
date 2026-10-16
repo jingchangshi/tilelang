@@ -38,6 +38,15 @@ class BackendModule:
     host_codegens: Mapping[str, HostCodegen] = field(default_factory=dict)
     host_codegen_hooks: Mapping[str, tuple[HostCodegenHook, ...]] = field(default_factory=dict)
     callbacks: Mapping[str, BackendCallback] = field(default_factory=dict)
+    # Whether this backend's compiled artifacts may be REUSED from a persistent
+    # kernel cache. A backend that injects an EXTERNAL, MUTABLE input (the
+    # PREBUILT HIVM entry injects a device binary read from a path) cannot be
+    # covered by the cache key: KernelCache._generate_key hashes the TIR, target,
+    # backend, pass configs and flags, but NOT the bytes of an injected binary.
+    # A warm entry would therefore be returned for a mutated binary. Declaring
+    # that here, on the backend, keeps the decision auditable and lets the cache
+    # layers consult ONE source instead of each testing the target shape.
+    cache_reusable: bool = True
 
     def __post_init__(self) -> None:
         target_kinds = tuple(self.target_kinds)
@@ -97,6 +106,18 @@ class BackendModule:
         if target.kind.name not in self.target_kinds:
             return False
         return self.supports_target(target) if self.supports_target is not None else True
+
+    def allows_persistent_cache_reuse(self) -> bool:
+        """Return whether THIS backend's artifacts may come from a disk cache.
+
+        This is a narrower question than `cache_reusable`: it is asked with the
+        already-SELECTED backend in hand, so callers never have to re-derive the
+        selection or mirror this backend's target predicate. A backend that
+        injects an external mutable artifact returns False here, and the cache
+        layers then compile instead of returning a stored entry.
+        """
+
+        return self.cache_reusable
 
     def _require_target(self, target: Target) -> str:
         target_kind = target.kind.name
@@ -298,6 +319,23 @@ def _list_backend_modules_for_target_kind(target_kind: str) -> tuple[BackendModu
 
 
 def _resolve_backend_module(target: Target) -> BackendModule:
+    # Mutually exclusive device selectors. "pto" and "hivm" name two different
+    # device backends; a target carrying both is not a legal input. This guard
+    # is deliberately scoped to the Ascend kind, because unrelated target kinds
+    # can legally carry the same feature keys.
+    #
+    # It must live HERE, before the candidate comprehension: matching is
+    # candidate OWNERSHIP, not a promise that resolution succeeds, so the
+    # generic "Multiple backends match" check below cannot be relied on to name
+    # this conflict (the HIVM predicate declines a pto-bearing target, which can
+    # leave exactly one candidate rather than two). Placing it in
+    # create_backend_context alone would miss direct resolver calls.
+    if target.kind.name == "ascend" and "pto" in target.keys and "hivm" in target.keys:
+        raise ValueError(
+            f"Conflicting backend selectors for target {target}: both 'pto' and 'hivm' are present; "
+            "these select mutually exclusive device backends"
+        )
+
     candidates = [backend for backend in _list_backend_modules_for_target_kind(target.kind.name) if backend.matches(target)]
     if not candidates:
         raise ValueError(f"No backend matches target {target}")

@@ -18,6 +18,9 @@ def test_builtin_backend_modules_are_explicit():
         "webgpu": (("webgpu",), ["tvm_ffi"]),
         "ascend": (("ascend",), ["tvm_ffi", "cython"]),
         "pto": (("ascend",), ["pto"]),
+        # The TEST_ONLY PREBUILT HIVM backend (P4-A): same target kind as
+        # AscendC/PTO, selected by the "hivm" key, tvm_ffi only (goal req 9).
+        "hivm": (("ascend",), ["tvm_ffi"]),
     }
 
     assert {

@@ -16,3 +16,12 @@ ASCEND_CODEGEN = DeviceCodegen(
     build=global_func_device_codegen("target.build.tilelang_ascend"),
     build_without_compile=global_func_device_codegen("target.build.tilelang_ascend_without_compile"),
 )
+
+# HIVM is the TEST_ONLY PREBUILT path: it does NOT run AscendC source codegen,
+# PTO codegen, or HIVM TIR->Late MLIR generation. It loads the frozen P3 binary
+# and validates it. The entry is a distinct global function so that the
+# isolation sentinels can observe it independently (P4-B.1).
+HIVM_CODEGEN = DeviceCodegen(
+    "ascend",
+    build=global_func_device_codegen("target.build.tilelang_hivm_prebuilt"),
+)

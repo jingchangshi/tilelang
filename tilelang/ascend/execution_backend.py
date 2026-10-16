@@ -24,3 +24,17 @@ ASCEND_EXECUTION_BACKENDS = [
 PTO_EXECUTION_BACKENDS = [
     ExecutionBackendSpec("pto"),
 ]
+
+# HIVM opens tvm_ffi ONLY (goal section 4 req 9). The PREBUILT module reuses the
+# existing TVM-FFI host ABI -- the P3 device ABI stays three GM pointers and the
+# host side allocates callee-allocated outputs, exactly as plain Ascend does --
+# so the same capability flag applies. cython and pto are rejected by their
+# absence here.
+HIVM_EXECUTION_BACKENDS = [
+    ExecutionBackendSpec(
+        "tvm_ffi",
+        enable_host_codegen=True,
+        enable_device_compile=True,
+        supports_callee_allocated_outputs=True,
+    ),
+]
