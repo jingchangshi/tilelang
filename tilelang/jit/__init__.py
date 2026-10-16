@@ -516,6 +516,41 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         # JIT functions that have no runtime tensor arguments to extract.
         return not has_tune_params and isinstance(self.func, JITFunc) and not self.func.tensor_args
 
+    def _backend_allows_cache_reuse(self) -> bool:
+        """Return whether the SELECTED backend may serve a stored kernel here.
+
+        BC-1 asks the question of the resolved backend rather than of the target
+        shape, so a backend that injects an external mutable artifact (the
+        PREBUILT HIVM entry) is covered without this object re-deriving the
+        selection or duplicating any target predicate.
+
+        A None target is NOT an unresolvable target: compilation resolves it from
+        TILELANG_DEFAULT_TARGET (see `_resolve_cache_dispatch`, which does `if
+        target is None: target = env.get_default_target()`), so this guard must
+        resolve it the same way BEFORE asking the backend. Skipping that step
+        made `create_backend_context(None)` raise and the fallback below answer
+        True -- i.e. it failed OPEN for a backend that HAD declared the refusal:
+        with TILELANG_DEFAULT_TARGET=hivm the resolved backend is HIVM
+        (cache_reusable=False), yet the local caches were still allowed to serve
+        a warm kernel and short-circuit before `compile()`. The fallback is kept
+        only for a target that genuinely cannot be resolved -- an unknown or
+        as-yet-unregistered target -- where no backend has declared a refusal.
+        """
+
+        try:
+            from tilelang.backend.module import create_backend_context
+
+            target = self.target
+            if target is None:
+                # Resolve exactly as compilation does; "auto" when unset.
+                from tilelang import env
+
+                target = env.get_default_target()
+            context = create_backend_context(target, self.target_host, self.execution_backend)
+            return context.module.allows_persistent_cache_reuse()
+        except Exception:  # noqa: BLE001
+            return True
+
     def __call__(self, *args: _P.args, **kwargs: _P.kwargs) -> _Ret:
         # Separate out the tuning parameters from the user's kwargs
         # Whether to return the compile arguments (out_idx, target, target_host, etc.) for autotuner cache
@@ -542,18 +577,40 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
             self.func.set_mode(self.mode)
 
         call_form_key = None
-        if self.is_lazy_mode() and self._can_use_call_form_cache(has_tune_params):
+        # BC-1: this object's LOCAL caches hold whole kernel objects, so a warm
+        # entry here would bypass the compile path entirely -- the same hazard as
+        # the disk cache above, one layer closer to the caller.
+        # COST (measured, not assumed): the helper resolves the backend on EVERY
+        # call, and resolution is NOT memoized -- `auto` probes the environment
+        # for an available target each time. Measured 64 us/call on the reusable
+        # default path (`auto` -> ascend) and 19 us/call on `hivm`, where HEAD
+        # paid 0 because it never made this call.
+        # NOT MEMOIZED (deliberate): the answer is a function of the backend
+        # RESOLUTION, and no key was found that captures every input to it. The
+        # ambient tvm.target.Target scope is one such input (determine_target
+        # ("auto") consults Target.current first); a key that includes it is
+        # still UNUSABLE for a documented dict target (unhashable) and still
+        # omits the mutable detector/normalizer/backend registries. A stale
+        # verdict here means a backend that refused reuse is served a warm
+        # kernel -- the fail-open R1 closed. See impl-r2/memo_failopen_probe.py
+        # and impl-r2/corrected_key_probe.py.
+        # NOTE: this is evaluated ONCE per call, before `self.compile()`; the
+        # helper resolves a None target from TILELANG_DEFAULT_TARGET, so it and
+        # the compilation below agree on the backend when the target is defaulted.
+        local_cache_ok = self._backend_allows_cache_reuse()
+        if local_cache_ok and self.is_lazy_mode() and self._can_use_call_form_cache(has_tune_params):
             kernel, call_form_key = self._call_form_cache.lookup(args, kwargs)
             if kernel is not _CALL_FORM_CACHE_MISS:
                 return kernel
 
         key, kernel_args = self.func.parse_args(*args, **kwargs)
-        kernel = self._kernel_cache.get(key, None)
+        kernel = self._kernel_cache.get(key, None) if local_cache_ok else None
         if kernel is None:
             kernel = self.compile(*args, **kwargs)
-            self._kernel_cache[key] = kernel
+            if local_cache_ok:
+                self._kernel_cache[key] = kernel
 
-        if call_form_key is not None and self.is_lazy_mode() and not kernel_args:
+        if call_form_key is not None and self.is_lazy_mode() and not kernel_args and local_cache_ok:
             self._call_form_cache.store(call_form_key, kernel)
 
         # eager mode: execute kernel immediately and return result

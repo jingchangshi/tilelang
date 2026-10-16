@@ -35,6 +35,14 @@ _ascend_dispatch_map: dict[str, KernelCache] = {
     "cython": AscendCythonKernelCache(),
 }
 
+# Backend module names that share the Ascend target KIND and must therefore use
+# the Ascend cache layout. This is an explicit list, not a `kind == "ascend"`
+# test, because PTO deliberately uses the GENERIC map and has no "pto" key in
+# _ascend_dispatch_map -- switching every Ascend-kind target over would make PTO
+# unresolvable. The literal names match the BackendModule `name=` arguments in
+# tilelang/ascend/backend.py.
+_ASCEND_CACHE_MODULES = frozenset({"ascend", "hivm"})
+
 
 def _resolve_cache_dispatch(
     target: TargetLike | None,
@@ -67,7 +75,10 @@ def _resolve_cache_dispatch(
                 ", ".join(sorted(allowed_now)),
             )
     # Dispatch on the resolved backend module rather than on the target kind.
-    dispatch_map = _ascend_dispatch_map if context.module.name == "ascend" else _dispatch_map
+    # The HIVM backend is named "hivm", so a bare `name == "ascend"` test sent
+    # it to the GENERIC map and gave an Ascend kernel CUDA `.cu` sidecar names
+    # (BC-5). The explicit set covers ascend and hivm only.
+    dispatch_map = (_ascend_dispatch_map if context.module.name in _ASCEND_CACHE_MODULES else _dispatch_map)
     if resolved_backend not in dispatch_map:
         raise ValueError(f'Cannot find support for execution backend "{resolved_backend}"')
     return dispatch_map[resolved_backend], context, verbose

@@ -359,6 +359,12 @@ class KernelCache:
                 backend_context=backend_context,
             )
 
+        # BC-1: a backend that injects an external mutable artifact must not be
+        # served from a cache whose key cannot see that artifact. The decision is
+        # read from the RESOLVED backend module, so the two return sites below do
+        # not have to re-derive the selection or mirror its target predicate.
+        cache_reusable = backend_context.module.allows_persistent_cache_reuse()
+
         key = self._generate_key(
             func=func,
             out_idx=out_idx,
@@ -373,7 +379,7 @@ class KernelCache:
             self.logger.info(f"Generated cache key: {key} for kernel {get_prim_func_name(func, '<unknown>')}")
         with self._lock:
             # First check in-memory cache
-            if key in self._memory_cache:
+            if cache_reusable and key in self._memory_cache:
                 # Include kernel name for easier debugging when hitting memory cache
                 kernel_name = get_prim_func_name(func, "<unknown>")
                 self.logger.warning(
@@ -388,6 +394,18 @@ class KernelCache:
         if execution_backend == "torch":
             # Metal's torch backend does not support cache yet
             env.disable_cache()
+            kernel = None
+        elif not cache_reusable:
+            # BC-1: never LOAD a stored entry for a non-reusable backend, and do
+            # not WRITE one either (the store below is keyed on the same flag).
+            # Compiling is the only correct answer: the injected bytes are not in
+            # the cache key, so a hit could describe a different binary.
+            if verbose:
+                self.logger.info(
+                    "Cache reuse is disabled for backend '%s' (it injects an "
+                    "external binary that the cache key does not cover).",
+                    backend_context.module.name,
+                )
             kernel = None
         else:
             # Disk loads can be expensive for large kernel sets; keep them outside
@@ -437,7 +455,10 @@ class KernelCache:
             )
         # Save outside the lock: staging+rename is atomic and idempotent (like the
         # disk load above). Holding the lock here serialized every worker's save.
-        if env.is_cache_enabled():
+        # BC-1: a non-reusable backend does not persist either. Writing an entry
+        # whose key omits the injected bytes would leave a poisoned entry for a
+        # LATER process, which no amount of read-side guarding could undo.
+        if env.is_cache_enabled() and cache_reusable:
             cache_path = self._get_cache_path(key)
             self._save_kernel_to_disk(key, kernel, func, verbose)
             # Set cache path on adapter so it can save cubin after first execution
@@ -446,6 +467,10 @@ class KernelCache:
         # Store in memory cache after compilation
         self._tag_kernel_cache_entry(kernel, key, self._get_cache_path(key))
         with self._lock:
+            if not cache_reusable:
+                # Do not seed the in-memory map either: it outlives this call and
+                # would serve the next invocation of the same key.
+                return kernel
             existing = self._memory_cache.get(key)
             if existing is not None:
                 return existing
