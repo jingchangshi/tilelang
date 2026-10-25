@@ -51,6 +51,17 @@ inline constexpr size_t kFrozenBinarySize = 4448;
 inline constexpr const char *kAibinFormat = "aibin";
 inline constexpr const char *kHivmPrebuiltFormat = "hivm-aibin";
 
+// P5: the GENERATED binary format token. A module built by the real HIVM
+// DeviceCodeGen is a different artefact from the frozen P3 program, so it gets
+// its own token rather than reusing `hivm-aibin`. The distinction is not
+// cosmetic: InspectSource reconstructs the frozen PREBUILT label for every
+// token that FormatUsesVectorCoreLoader accepts (BC-4), so a generated module
+// reusing that token would describe itself, after a save/restore round trip, as
+// a P3 PREBUILT artefact its producer never read. The generated token keeps the
+// LOADER policy (VECTOR_CORE, still the only loader that works -- P3
+// E0/E1/E2/E3) and drops the PREBUILT provenance.
+inline constexpr const char *kHivmGeneratedFormat = "hivm-generated-aibin";
+
 // The auditable TEST_ONLY description returned by inspect_source (CR-PB-1).
 // It states the PREBUILT origin and names the frozen binary's source path. It
 // deliberately contains NO generated-source text of any kind: P4 generated
@@ -78,7 +89,17 @@ inline std::string HivmPrebuiltSourceLabel() {
 // The format token that selects the VECTOR_CORE loader policy. Kept as a
 // predicate so the loader and the restore path cannot disagree about which
 // token means which policy.
+// The VECTOR_CORE loader policy is a property of the binary KIND, not of a
+// single producer: both the frozen PREBUILT program and a freshly generated
+// program are HIVM AIV binaries and need the same loader. Provenance is decided
+// separately by FormatIsPrebuilt.
 inline bool FormatUsesVectorCoreLoader(const std::string &fmt) {
+  return fmt == kHivmPrebuiltFormat || fmt == kHivmGeneratedFormat;
+}
+
+// Exactly one token denotes the frozen P3 artefact. Only that token may be
+// described as PREBUILT, so a generated module can never inherit the label.
+inline bool FormatIsPrebuilt(const std::string &fmt) {
   return fmt == kHivmPrebuiltFormat;
 }
 

@@ -382,7 +382,12 @@ public:
       // source map, so the honest PREBUILT label is RECONSTRUCTED from the
       // retained format token instead of being lost with the map. Nothing is
       // invented for an "aibin" module: only the HIVM format has that origin.
-      if (hivm_prebuilt::FormatUsesVectorCoreLoader(fmt_)) {
+      //
+      // P5: the reconstruction is gated on the OWNING token, not on the loader
+      // predicate. A generated module now shares the VECTOR_CORE loader, so
+      // keying it on FormatUsesVectorCoreLoader would make a generated binary
+      // report the frozen P3 path and digest as its source.
+      if (hivm_prebuilt::FormatIsPrebuilt(fmt_)) {
         return ffi::String(hivm_prebuilt::HivmPrebuiltSourceLabel());
       }
     }
@@ -580,7 +585,8 @@ static ffi::Module AscendModuleLoadFromBytes(const ffi::Bytes &bytes) {
   // is still refused with the original message.
   const std::string fmt_str = static_cast<std::string>(fmt);
   TVM_FFI_CHECK(fmt_str == hivm_prebuilt::kAibinFormat ||
-                    fmt_str == hivm_prebuilt::kHivmPrebuiltFormat,
+                    fmt_str == hivm_prebuilt::kHivmPrebuiltFormat ||
+                    fmt_str == hivm_prebuilt::kHivmGeneratedFormat,
                 RuntimeError)
       << "Unsupported Ascend module format `" << fmt
       << "`. This is likely a legacy source-only cache entry; remove it and "
@@ -592,10 +598,20 @@ static ffi::Module AscendModuleLoadFromBytes(const ffi::Bytes &bytes) {
                             ffi::Map<ffi::String, ffi::String>());
 }
 
+// Test entry: serialize a module through its own SaveToBytes. The tvm-ffi build
+// this repository links does not export `save_to_bytes` to Python, so the
+// save/restore round trip that decides the BC-4 provenance label cannot be
+// exercised without it. It serializes whatever module it is given; it holds no
+// state and decides nothing.
+static ffi::Bytes AscendModuleSaveToBytes(const ffi::Module &mod) {
+  return mod->SaveToBytes();
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
       .def("ffi.Module.load_from_bytes.asc", AscendModuleLoadFromBytes)
+      .def("tl.ascend.ModuleSaveToBytes", AscendModuleSaveToBytes)
       .def("tl.ascend.ModuleCreate", AscendModuleCreate);
 }
 
