@@ -96,11 +96,14 @@ def test_dma_stage_is_emitted_from_the_tir_offsets():
 
 
 def test_per_block_gm_stride_comes_from_the_tir():
-    """The GM offset is blockIdx * 8192, and 8192 = 524288 / 64 is checked."""
+    """The GM offset is blockIdx * 8192, and 8192 = 524288 / 64 is checked.
+
+    The block index is minted ONCE and every subview reuses it: the approved
+    Late input verifier refuses a module that derives its three subviews from
+    three distinct `get_block_idx` values. So one op, three multiplies.
+    """
     mlir = _emit()
-    assert mlir.count("hivm.hir.get_block_idx") == 3
-    assert mlir.count("arith.muli %gm_src_0_bid, %c8192_i64 : i64") == 1
-    assert mlir.count("arith.muli %gm_dst_2_bid, %c8192_i64 : i64") == 1
+    assert mlir.count("arith.muli %bx, %c8192_i64 : i64") == 3
     assert "memref<524288xf32, #hivm.address_space<gm>>" in mlir
 
 
@@ -197,3 +200,278 @@ def test_generated_format_token_differs_from_prebuilt():
     identity = (REPO / "src/ascend/hivm_prebuilt_identity.h").read_text()
     assert 'kHivmPrebuiltFormat = "hivm-aibin"' in identity
     assert 'kHivmGeneratedFormat = "hivm-generated-aibin"' in identity
+
+
+# ---------------------------------------------------------------------------
+# Semantic mutation regressions: an input change MUST change the output or be
+# refused. Each case below is VALID TIR -- it survives save_json/load_json and
+# structural equality -- that changes what the program computes, so returning
+# the unchanged frozen text for it is a false acceptance, not a conservative one.
+#
+# These are CODE GEN checks. A mutation that failed to CONSTRUCT the TIR would
+# prove nothing about the emitter, so `_mutated` asserts the round trip first:
+# a parser refusal must never be counted as a codegen refusal.
+#
+# `_mutated` loads the Golden ONCE and mutates THAT function's body, keeping its
+# own `params`. Rewriting the body of one loaded module onto the params of
+# another makes every parameter reference in the body a free Var of a different
+# module; a name-based GM check would not notice, and JSON round-tripping does
+# not detect it either, because each module is internally consistent. Only
+# deriving body and params from the same object is faithful.
+# ---------------------------------------------------------------------------
+
+
+def _mutated(transform, node_types):
+    """Mutate the Golden's ONE kernel in place and return (module, target).
+
+    Single load, single source of `params` and `body`. The result is proven to
+    be reloadable TIR before anything asks the emitter about it.
+    """
+    from tvm import tirx
+
+    mod, kernel = _golden()
+    key = list(mod.functions)[0]
+    fn = mod[key]
+    body = tirx.stmt_functor.ir_transform(fn.body, None, transform, node_types)
+    # params, buffer_map and attrs come from the SAME function the body did.
+    mutated = tvm.ir.IRModule(
+        {
+            tvm.ir.GlobalVar(key.name_hint): tirx.PrimFunc(
+                fn.params, body, fn.ret_type, fn.buffer_map, fn.attrs, fn.span
+            )
+        }
+    )
+    reloaded = tvm.ir.load_json(tvm.ir.save_json(mutated))
+    tvm.ir.assert_structural_equal(reloaded, mutated)
+    return reloaded, _hivm_target(kernel)
+
+
+def _emit_module(mod, target):
+    return tvm.ffi.get_global_func(EMIT_ENTRY)(mod, target)
+
+
+def _op_name(expr):
+    """The registered name of a Call's callee, or "" when it is not an Op.
+
+    `str(call.op)` is the Op's REPR ("ir.Op(span=None, ... name=\"tl.simd.vld\"...)"),
+    not its name, so comparing it against an op name never matches. Every
+    mutation helper goes through this function for that reason.
+    """
+    op = getattr(expr, "op", None)
+    return getattr(op, "name", "") or ""
+
+
+def test_vf_constant_address_is_refused_not_reemitted():
+    """A constant vld address is REFUSED, not silently re-indexed.
+
+    The emitted subview is indexed by the loop variable ALONE (`%a[%i] [64]`),
+    so a TIR reading `A[0:64]` on every iteration would otherwise emit text
+    identical to the Golden's, which reads `A[i*64]`. Those are different
+    programs: at i=1 the mutation reads A[0:64] and the Golden reads A[64:128].
+
+    The near-neighbour matters as much as the refusal: the DMA addresses in this
+    same module ARE constants (`[0]`, `[16384]`, `[32768]`) and must stay legal,
+    so the refusal is scoped to VF accesses. The untouched Golden still emitting
+    is asserted below and by every other test in this file.
+    """
+    from tvm import tirx
+
+    original = _emit()
+    hits = []
+
+    def to_constant(node):
+        # The vld is a Bind VALUE, so it is reached here by rebuilding the Bind
+        # around a rewritten call rather than by expecting expression recursion.
+        if isinstance(node, tirx.Bind):
+            value = node.value
+            if isinstance(value, tirx.Call) and _op_name(value) == "tl.simd.vld":
+                load = value.args[0].args[0]
+                if isinstance(load.indices[0], tirx.Mul):
+                    hits.append(str(load.indices[0]))
+                    flat = tirx.BufferLoad(load.buffer, [tirx.IntImm("int32", 0)])
+                    return tirx.Bind(
+                        node.var,
+                        tirx.Call(
+                            value.dtype,
+                            value.op,
+                            [tirx.address_of(flat), value.args[1]],
+                        ),
+                    )
+        return None
+
+    mod, target = _mutated(to_constant, ["tirx.Bind"])
+    # The mutation has to have LANDED, or a passing refusal would be meaningless.
+    assert hits, "the vld mutation never applied: the test would prove nothing"
+
+    with pytest.raises(Exception) as excinfo:
+        _emit_module(mod, target)
+    message = str(excinfo.value)
+    assert "constant address" in message, message
+    assert "vld" in message
+
+    assert _emit() == original
+
+
+def test_vadd_mask_operand_is_taken_from_the_call():
+    """The vadd predicate comes from the CALL, not from a fixed `%mask`.
+
+    Emitting `%mask` unconditionally describes "add under the ALL predicate" no
+    matter which predicate the TIR passed. A predicate this emitter assigned no
+    value to -- here an all-false broadcast, which under MODE_ZEROING must zero
+    the result -- is an operand the subset cannot honour, so it is refused
+    rather than silently replaced by the frozen predicate.
+    """
+    from tvm import tirx
+
+    original = _emit()
+    hits = []
+
+    def to_false_mask(node):
+        if isinstance(node, tirx.Bind):
+            value = node.value
+            if isinstance(value, tirx.Call) and _op_name(value) == "tl.simd.vadd":
+                hits.append(str(node.var))
+                false_mask = tirx.Broadcast(tirx.IntImm("bool", 0), 256)
+                return tirx.Bind(
+                    node.var,
+                    tirx.Call(
+                        value.dtype,
+                        value.op,
+                        [value.args[0], value.args[1], false_mask, value.args[3]],
+                    ),
+                )
+        return None
+
+    mod, target = _mutated(to_false_mask, ["tirx.Bind"])
+    assert hits, "the vadd mask mutation never applied: the test would prove nothing"
+
+    with pytest.raises(Exception) as excinfo:
+        _emit_module(mod, target)
+    message = str(excinfo.value)
+    assert "vadd mask" in message, message
+    assert "bound vector value" in message
+
+    assert _emit() == original
+
+
+def _loop_step_transform(step):
+    from tvm import tirx
+
+    def set_step(node):
+        if isinstance(node, tirx.For):
+            return tirx.For(
+                node.loop_var,
+                node.min,
+                node.extent,
+                node.kind,
+                node.body,
+                node.thread_binding,
+                node.annotations,
+                step=tirx.IntImm("int32", step),
+            )
+        return None
+
+    return set_step
+
+
+def test_vf_loop_step_must_be_one():
+    """A VF loop with step=2 is refused; the explicit step=1 neighbour is not.
+
+    `scf.for ... step %c64_i` walks ELEMENTS one lane at a time and cannot
+    express a TIR step, so a step of 2 would emit the unchanged 128-iteration
+    text for a loop the TIR runs 64 times -- a silent change in both iteration
+    count and covered range.
+
+    step=1 is the discriminating neighbour: refusing every explicit `step`
+    would be a different, wrong fix, and it would reject a module the Golden's
+    own semantics allow.
+    """
+    from tvm import tirx
+
+    original = _emit()
+
+    mod_two, target_two = _mutated(_loop_step_transform(2), ["tirx.For"])
+    with pytest.raises(Exception) as excinfo:
+        _emit_module(mod_two, target_two)
+    message = str(excinfo.value)
+    assert "VF loop step 2" in message, message
+
+    # step=1 is semantically "no step" and must still be accepted, unchanged.
+    mod_one, target_one = _mutated(_loop_step_transform(1), ["tirx.For"])
+    assert _emit_module(mod_one, target_one) == original
+
+
+def test_kernel_symbol_is_one_name_for_text_and_metadata():
+    """The emitted `func.func` name and the runtime FunctionInfo key agree.
+
+    A device PrimFunc with no `global_symbol` used to emit `main_kernel` while
+    the runtime metadata was keyed by the GlobalVar name: the build succeeded and
+    the launch lookup then failed on a symbol nobody had declared. ONE resolution
+    now feeds both, falling back to the GlobalVar name.
+    """
+    from tvm import tirx
+    from tvm.ir import DictAttrs
+
+    mod, kernel = _golden()
+    key = list(mod.functions)[0]
+    fn = mod[key]
+    attrs = {
+        name: value
+        for name, value in fn.attrs.items()
+        if name not in ("global_symbol", "tirx.global_symbol")
+    }
+    assert "global_symbol" not in attrs, "the mutation must remove the symbol"
+    stripped = tirx.PrimFunc(
+        fn.params, fn.body, fn.ret_type, fn.buffer_map, DictAttrs(attrs), fn.span
+    )
+    renamed = tvm.ir.IRModule({tvm.ir.GlobalVar("vadd_renamed"): stripped})
+    mod = tvm.ir.load_json(tvm.ir.save_json(renamed))
+
+    mlir = _emit_module(mod, _hivm_target(kernel))
+    # The GlobalVar name is the ONE name both sides use -- not a bare "main_kernel".
+    assert mlir.count("func.func @vadd_renamed(") == 1
+    assert "func.func @main_kernel(" not in mlir
+    assert "func.call @vadd_renamed_simd_vf_0(" in mlir
+
+
+def test_vf_constant_store_address_is_refused_too():
+    """The vsts address is guarded like the vld address, not only the load.
+
+    The store is an `Evaluate`, not a `Bind`, and its index is an `Add`
+    (`i*64 + 32768`) rather than a bare `Mul`, so a mutation written for the
+    load path (Bind + Mul) silently matches NOTHING here and the test would
+    pass without ever mutating. That is why this case is separate: it anchors
+    on the store's own shape and asserts the mutation LANDED before asserting
+    the refusal.
+    """
+    from tvm import tirx
+
+    original = _emit()
+    hits = []
+
+    def to_constant(node):
+        if isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call):
+            if _op_name(node.value) == "tl.simd.vsts":
+                value = node.value
+                load = value.args[0].args[0]
+                hits.append(str(load.indices[0]))
+                flat = tirx.BufferLoad(load.buffer, [tirx.IntImm("int32", 0)])
+                return tirx.Evaluate(
+                    tirx.Call(
+                        value.dtype,
+                        value.op,
+                        [tirx.address_of(flat), *value.args[1:]],
+                    )
+                )
+        return None
+
+    mod, target = _mutated(to_constant, ["tirx.Evaluate"])
+    assert hits, "the vsts mutation never applied: the test would prove nothing"
+
+    with pytest.raises(Exception) as excinfo:
+        _emit_module(mod, target)
+    message = str(excinfo.value)
+    assert "constant address" in message, message
+    assert "vsts" in message, message
+
+    assert _emit() == original
