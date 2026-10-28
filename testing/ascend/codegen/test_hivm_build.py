@@ -9,16 +9,21 @@ They are deliberately split by what they need:
   is unset the test SKIPS rather than substituting a weaker check, so a green
   run never implies a compile happened when one did not.
 
-The frozen P3 binary digest is asserted AGAINST, never returned: the point of
-the compile test is that an independently generated program reproduces that
-binary, which is only meaningful if the digest is an expected value here and not
-a lookup key anywhere in the producer.
+The frozen P3 binary digest is asserted AGAINST only as an INEQUALITY, never as
+an expected value. The compile test proves the build produced a FRESH, loadable
+AIV program; it deliberately does not require byte equality with the P3
+artifact. Two reasons: the design doc (section 3.4) forbids a historical binary
+digest as a correctness standard, and the current compiler links whatever
+template bitcode is installed next to it, so a legitimate O2/O0 difference would
+otherwise fail a correct build. The digest therefore names an artifact this
+round REFUSES to accept, and is never a lookup key anywhere in the producer.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import struct
 from pathlib import Path
 
 import pytest
@@ -33,7 +38,12 @@ LOAD_ENTRY = "ffi.Module.load_from_bytes.asc"
 GENERATED_FMT = "hivm-generated-aibin"
 PREBUILT_FMT = "hivm-aibin"
 
-# The frozen P3 AIV binary this phase must reproduce byte for byte.
+# The frozen P3 AIV artifact. It is RECORDED here as an identity this round
+# refuses to accept, never as an expected value: the design doc (section 3.4)
+# forbids historical binary digest equality as a correctness standard, because
+# the current compiler legitimately links its own installed template bitcode
+# and therefore produces different bytes. It is still named in the PREBUILT
+# provenance label (hivm_prebuilt_identity.h), which is a different concern.
 FROZEN_SHA256 = "2c4247c3b2ce11f79ad15415eb06d4ce1d5523a0c19c91ad3743bc08e7b8c4c9"
 FROZEN_SIZE = 4448
 
@@ -83,17 +93,142 @@ def test_build_without_hook_fails_rather_than_returning_a_prebuilt(built):
     assert "never falls back" in message
 
 
-def test_generated_binary_is_the_frozen_aiv_binary(built):
-    """An independently generated program reproduces the frozen binary.
+def _elf_header_facts(blob: bytes) -> dict:
+    """The AIV ELF header fields the artifact screen relies on."""
+    assert blob[:4] == b"\x7fELF", f"not an ELF: {blob[:8]!r}"
+    return {
+        "ei_class": blob[4],
+        "ei_data": blob[5],
+        "e_type": struct.unpack_from("<H", blob, 16)[0],
+        "e_machine": struct.unpack_from("<H", blob, 18)[0],
+        "e_flags": struct.unpack_from("<I", blob, 48)[0],
+        "e_shoff": struct.unpack_from("<Q", blob, 0x28)[0],
+        "e_shentsize": struct.unpack_from("<H", blob, 0x3A)[0],
+        "e_shnum": struct.unpack_from("<H", blob, 0x3C)[0],
+    }
 
-    Equality here is the strongest available statement short of hardware: the
-    TIR was read, Late MLIR was emitted, the Late pipeline ran, and the result
-    is bit-identical to the artifact P2/P3 accepted.
+
+def _elf_length_from_headers(blob: bytes) -> int:
+    """The artifact's own statement of its length: end of the section header table."""
+    f = _elf_header_facts(blob)
+    return f["e_shoff"] + f["e_shentsize"] * f["e_shnum"]
+
+
+def _device_program(blob: bytes) -> bytes:
+    """Cut the AIV device program out of a serialized AscendModule.
+
+    SaveToBytes writes [fmt][fmap][code], so the device program is the
+    trailing ELF. Its length is taken from its OWN section headers rather than
+    by slicing a fixed number of bytes from the end: a fixed slice bakes the
+    historical artifact's size into the test, and the current compiler
+    legitimately produces a different size.
+    """
+    start = blob.find(b"\x7fELF")
+    assert start >= 0, "no ELF magic in the serialized module"
+    elf = blob[start:]
+    length = _elf_length_from_headers(elf)
+    assert 0 < length <= len(elf), f"ELF claims {length} bytes, only {len(elf)} present"
+    return elf[:length]
+
+
+def _defined_global_function_symbols(blob: bytes) -> set[str]:
+    """Names of DEFINED GLOBAL/WEAK STT_FUNC symbols, read from the symtab.
+
+    The binding/type/shndx triple matters: the frozen artifact also carries a
+    LOCAL `main_kernel$local` and the kernel is referenced as an undefined
+    symbol on some paths, so a bare name match would accept the wrong entry.
+    An undefined reference is not a kernel the ACL loader can resolve.
+    """
+    f = _elf_header_facts(blob)
+
+    def section(i: int) -> dict:
+        o = f["e_shoff"] + i * f["e_shentsize"]
+        return {
+            "type": struct.unpack_from("<I", blob, o + 4)[0],
+            "offset": struct.unpack_from("<Q", blob, o + 0x18)[0],
+            "size": struct.unpack_from("<Q", blob, o + 0x20)[0],
+            "link": struct.unpack_from("<I", blob, o + 0x28)[0],
+            "entsize": struct.unpack_from("<Q", blob, o + 0x38)[0],
+        }
+
+    names: set[str] = set()
+    for i in range(f["e_shnum"]):
+        s = section(i)
+        if s["type"] != 2:                       # SHT_SYMTAB
+            continue
+        str_base = section(s["link"])["offset"]
+        entsize = s["entsize"] or 24             # Elf64_Sym
+        for j in range(s["size"] // entsize):
+            o = s["offset"] + j * entsize
+            name_off = struct.unpack_from("<I", blob, o)[0]
+            info = blob[o + 4]
+            shndx = struct.unpack_from("<H", blob, o + 6)[0]
+            if (info >> 4) not in (1, 2):        # STB_GLOBAL / STB_WEAK
+                continue
+            if (info & 0xF) != 2:                # STT_FUNC
+                continue
+            if shndx == 0:                       # SHN_UNDEF
+                continue
+            end = blob.find(b"\x00", str_base + name_off)
+            names.add(blob[str_base + name_off:end].decode("utf-8", "replace"))
+    return names
+
+
+def test_generated_artifact_is_a_fresh_aiv_program(built):
+    """The build produced a NEW, loadable AIV device program.
+
+    Renamed from `test_generated_binary_is_the_frozen_aiv_binary`. Byte
+    equality with the frozen artifact is deliberately NOT asserted: the design
+    doc (section 3.4) and the work order forbid treating a historical binary
+    digest as a correctness standard, and the current compiler legitimately
+    emits different bytes because it links its own installed template bitcode
+    rather than the P2 one. The final inequality is the real teeth -- it is
+    what proves this binary came from THIS compile rather than being
+    substituted from the evidence tree.
+
+    Every assertion below holds for any correct output of the current
+    compiler and names no template level, so a legitimate O2<->O0 switch does
+    not invalidate it. Observed once (2026-10-28, installed compiler
+    e73314b8..., unprefixed template fbc87c25...): 4904 B, sha256
+    54c866b8e5fb6091f4345be11a82b9c04470df91f97ed5dfd18504eb3800aeeb. Those
+    values are a RECORD, not a fixture: they are expected to change.
     """
     blob = bytes(tvm.ffi.get_global_func(SAVE_ENTRY)(built))
-    binary = blob[-FROZEN_SIZE:]
-    assert len(binary) == FROZEN_SIZE
-    assert hashlib.sha256(binary).hexdigest() == FROZEN_SHA256
+
+    # The GENERATED token is the loader-policy carrier, so it must be present;
+    # the PREBUILT token must not be. Checked in the BYTES: inspect_source(fmt)
+    # returns the raw device binary for the module's own format token, so it is
+    # not a usable accessor for this question.
+    assert GENERATED_FMT.encode() in blob, "serialized module lacks the GENERATED token"
+    assert PREBUILT_FMT.encode() not in blob, "a generated module must not carry the PREBUILT token"
+
+    binary = _device_program(blob)
+
+    # AIV shape: the same screen tilelang.contrib.hivm applies to the compiler
+    # output, re-checked here so the test fails where the artifact is built.
+    facts = _elf_header_facts(binary)
+    assert facts["ei_class"] == 2, "not ELF64"
+    assert facts["ei_data"] == 1, "not little-endian"
+    assert facts["e_type"] == 2, f"e_type={facts['e_type']}, expected ET_EXEC"
+    assert facts["e_machine"] == 0x1029, f"e_machine=0x{facts['e_machine']:04x}, expected Ascend AIV"
+    assert facts["e_flags"] == 0x990000, f"e_flags=0x{facts['e_flags']:08x}, expected AIV"
+
+    # The symbol the runtime resolves must be DEFINED, GLOBAL/WEAK and a FUNC.
+    symbols = _defined_global_function_symbols(binary)
+    assert "main_kernel" in symbols, (
+        f"main_kernel is not a defined GLOBAL/WEAK FUNC symbol; found {sorted(symbols)}"
+    )
+
+    # Self-consistency: the length comes from the headers and is non-zero.
+    assert len(binary) == _elf_length_from_headers(binary)
+    assert len(binary) > 0
+
+    # Freshness: this is NOT the frozen P3 artifact.
+    assert hashlib.sha256(binary).hexdigest() != FROZEN_SHA256, (
+        "the built binary is byte-identical to the frozen P3 artifact, which would "
+        "mean a historical file was substituted for a fresh compile"
+    )
+    assert len(binary) != FROZEN_SIZE
 
 
 def test_generated_module_does_not_claim_prebuilt_provenance(built):
