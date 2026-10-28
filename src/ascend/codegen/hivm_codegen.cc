@@ -36,6 +36,8 @@
 // SUPPORTED SUBSET (P5-2: the frozen Golden's shape only)
 // clang-format off
 //   AttrStmt(thread_extent, blockIdx.x)     -> hacc.entry + block_dim
+//                                              + ONE hivm.hir.get_block_idx
+//                                                reused by all three GM subviews
 //   AllocBuffer(uint8, shared.dyn)          -> the dynamic UB arena
 //   DeclBuffer(shared.dyn)                  -> an alias of that arena
 //   SBlock("VECTOR")                        -> the entry body
@@ -175,11 +177,12 @@ std::string OpName(const CallNode *call) {
 
 class Emitter {
 public:
-  explicit Emitter(const PrimFunc &f) : fn_(f) {
-    name_ = "main_kernel";
-    if (auto s = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol)) {
-      name_ = static_cast<std::string>(s.value());
-    }
+  Emitter(const PrimFunc &f, std::string symbol)
+      : fn_(f), name_(std::move(symbol)) {
+    TVM_FFI_ICHECK(!name_.empty())
+        << "HIVM CodeGen: the kernel entry symbol is empty; the emitted "
+           "'func.func' name and the runtime FunctionInfo must be the same "
+           "non-empty symbol";
   }
 
   std::string Run() {
@@ -245,37 +248,100 @@ private:
                load->indices[0]};
   }
 
-  // UB element index -> BYTES, refusing a non-constant base. The vector ops use
-  // `i * step + base`; `base` is the constant part.
-  int64_t ElemBase(const PrimExpr &ix, const std::string &what) const {
+  // UB element index -> its CONSTANT base in ELEMENTS.
+  //
+  // The vector ops index as `i * 64 + base` (or `i * 64`, base 0); a DMA inside
+  // the VECTOR block uses a plain constant. Both the loop variable AND the
+  // stride are validated, not assumed: `i * 32` or `j * 64` would address a
+  // different element with the same base, so a base-only reading would emit the
+  // unchanged frozen text for a real data-flow change. An index outside those
+  // two shapes is refused rather than reinterpreted.
+  //
+  // `require_iteration` is what separates the two callers. A DMA addresses one
+  // fixed slot, so a constant index is the LEGAL shape. A VF access does not:
+  // the emitted subview is indexed by the loop variable ALONE (`EmitVfSlotView`),
+  // so a constant TIR index emits the unchanged frozen text and silently
+  // rewrites "read A[0:64] every iteration" into "read A[i*64 ...]". Accepting a
+  // constant here therefore turns a real semantic change into a byte-identical
+  // module -- the false acceptance the VF callers must refuse.
+  int64_t ElemBase(const PrimExpr &ix, const std::string &what,
+                   bool require_iteration = false) const {
     if (auto v = ix.as<IntImmNode>()) {
+      if (require_iteration) {
+        Fail(scope_, what + " `" + Show(ix) +
+                         "` (a constant address; a VF access must carry the "
+                         "per-iteration term `i * 64`, because the emitted "
+                         "subview is indexed by the loop variable alone)");
+      }
       return v->value;
     }
-    // `i * 64` is the slot-A form: the whole index is the per-iteration term,
-    // so the constant base is 0.
-    if (const auto *mul = ix.as<MulNode>()) {
-      bool saw_const = false;
-      for (const PrimExpr *side : {&mul->a, &mul->b}) {
-        if (side->as<IntImmNode>() != nullptr) {
-          saw_const = true;
-        } else if (side->as<VarNode>() == nullptr) {
-          Fail(scope_, what + " `" + Show(ix) + "` (non-affine term)");
+    if (const auto *add = ix.as<AddNode>()) {
+      const PrimExpr *term = nullptr;
+      int64_t base = 0;
+      for (const PrimExpr *side : {&add->a, &add->b}) {
+        if (auto v = side->as<IntImmNode>()) {
+          base += v->value;
+        } else if (term == nullptr) {
+          term = side;
+        } else {
+          Fail(scope_, what + " `" + Show(ix) + "` (two non-constant terms)");
         }
       }
-      if (!saw_const) {
-        Fail(scope_, what + " `" + Show(ix) + "` (no constant stride)");
+      if (term == nullptr) {
+        Fail(scope_, what + " `" + Show(ix) + "` (no per-iteration term)");
       }
+      // The per-iteration term contributes 0 to the constant base, but it must
+      // still be the loop variable times one lane of elements.
+      LoopTerm(term, ix, what);
+      return base;
+    }
+    if (ix.as<MulNode>() != nullptr) {
+      LoopTerm(&ix, ix, what);
       return 0;
     }
-    if (const auto *add = ix.as<AddNode>()) {
-      if (auto b = add->b.as<IntImmNode>()) {
-        return b->value;
-      }
-      if (auto a = add->a.as<IntImmNode>()) {
-        return a->value;
+    Fail(scope_, what + " `" + Show(ix) + "` (no constant base)");
+  }
+
+  // The per-iteration term of a UB index: `loop_var * kLanes`, and nothing else.
+  void LoopTerm(const PrimExpr *term, const PrimExpr &whole,
+                const std::string &what) const {
+    const auto *mul = term->as<MulNode>();
+    if (mul == nullptr) {
+      Fail(scope_, what + " `" + Show(whole) + "` (non-affine term)");
+    }
+    const VarNode *var = nullptr;
+    int64_t stride = 0;
+    bool saw_const = false;
+    for (const PrimExpr *side : {&mul->a, &mul->b}) {
+      if (auto v = side->as<IntImmNode>()) {
+        stride = v->value;
+        saw_const = true;
+      } else if (const auto *v = side->as<VarNode>()) {
+        if (var != nullptr) {
+          Fail(scope_, what + " `" + Show(whole) + "` (two non-constant factors)");
+        }
+        var = v;
+      } else {
+        Fail(scope_, what + " `" + Show(whole) + "` (non-affine term)");
       }
     }
-    Fail(scope_, what + " `" + Show(ix) + "` (no constant base)");
+    if (var == nullptr) {
+      Fail(scope_, what + " `" + Show(whole) + "` (no loop variable)");
+    }
+    if (!saw_const) {
+      Fail(scope_, what + " `" + Show(whole) + "` (no constant stride)");
+    }
+    if (loop_var_var_.defined() && !loop_var_var_.same_as(GetRef<Var>(var))) {
+      Fail(scope_, what + " `" + Show(whole) + "` (indexed by `" +
+                       static_cast<std::string>(var->name_hint) +
+                       "`, not the loop variable `" +
+                       static_cast<std::string>(loop_var_var_->name_hint) + "`)");
+    }
+    if (stride != kLanes) {
+      Fail(scope_, what + " `" + Show(whole) + "` (stride " +
+                       std::to_string(stride) + ", one iteration moving " +
+                       std::to_string(kLanes) + " elements)");
+    }
   }
 
   // -- entry ----------------------------------------------------------------
@@ -293,6 +359,27 @@ private:
       Fail(scope_, "grid " + std::to_string(grid_) + " (the supported shape " +
                        "has " + std::to_string(kGrid) + " blocks)");
     }
+    // The block index the GM offsets must derive from. The Late form binds
+    // `hivm.hir.get_block_idx` to exactly ONE value that every subview reuses
+    // (the frozen P1v2 text does exactly this with its single `%bx`), and the
+    // approved Late input verifier ENFORCES it: three distinct index values are
+    // refused as "the frozen form derives all three from the single
+    // hivm.hir.get_block_idx result". Emitting one op per subview therefore
+    // produces a module the Late pipeline rejects, so the value is minted once
+    // below and cached in block_index_.
+    //
+    // Holding the IterVar is also what makes a SWAPPED block variable
+    // DETECTABLE. Without the identity check in EmitGmSubview, ANY Var in the
+    // `x * 8192` product would be emitted as `get_block_idx`, so a mutated TIR
+    // would reproduce the unchanged frozen text -- the exact false acceptance
+    // the semantic mutation tests exist to catch.
+    const auto *iter = attrs->node.as<IterVarNode>();
+    if (iter == nullptr) {
+      Fail(scope_, "thread_extent node as `" +
+                       std::string(attrs->node.GetTypeKey()) +
+                       "` (expected the blockIdx IterVar)");
+    }
+    block_var_ = iter->var;
     const auto *s = attrs->body.as<SeqStmtNode>();
     if (s == nullptr) {
       Fail(scope_, "thread_extent body as `" +
@@ -359,6 +446,10 @@ private:
         Fail(scope_, "sblock `" + bname + "`");
       }
       EmitVectorBody(GetRef<SBlock>(blk), &vf_fn);
+    }
+    if (!block_index_emitted_) {
+      Fail(scope_, "a module whose GM accesses never derive from the block "
+                   "index (this subset reads and writes a GM tile per block)");
     }
 
     // The completion barrier is an ENTRY responsibility (P1 D013): the Late cut
@@ -527,7 +618,7 @@ private:
     }
     const Ptr dst = CheckUb(AddressOf(call->args[0], "GM->UB destination"));
     const Ptr src = CheckGm(AddressOf(call->args[1], "GM->UB source"));
-    const int64_t dst_elem = ElemBase(dst.index, "GM->UB UB offset");
+    const int64_t dst_elem = ElemBase(dst.index, "GM->UB UB offset", /*require_iteration=*/false);
     const int64_t dst_byte = dst_elem * DtypeBytes(DataType::Float(32));
 
     RequireArg(call, 2, 0, "GM->UB sid");
@@ -560,7 +651,7 @@ private:
     }
     const Ptr dst = CheckGm(AddressOf(call->args[0], "UB->GM destination"));
     const Ptr src = CheckUb(AddressOf(call->args[1], "UB->GM source"));
-    const int64_t src_elem = ElemBase(src.index, "UB->GM UB offset");
+    const int64_t src_elem = ElemBase(src.index, "UB->GM UB offset", /*require_iteration=*/false);
     const int64_t src_byte = src_elem * DtypeBytes(DataType::Float(32));
 
     // The frozen store is cache mode 4 (P1 D012). Another value is not "wrong"
@@ -614,6 +705,17 @@ private:
   }
 
   // gm[bx * per_block] -> a subview of the shape parameter.
+  //
+  // THE BLOCK INDEX IS MINTED ONCE. All three GM subviews must reuse a single
+  // `hivm.hir.get_block_idx` result, which is both the frozen P1v2 shape and a
+  // condition the approved Late input verifier enforces (V6: three distinct
+  // index values are refused). So the first subview emits the op and stores its
+  // SSA name in `block_index_`; every later subview reuses that name.
+  //
+  // The `arith.muli` is kept for EVERY subview on purpose. The Late verifier
+  // walks each GM subview back through
+  // `index_cast(muli(get_block_idx, 8192))`, so a later subview that skipped the
+  // multiply would fail the chain even though the index value is the same.
   void EmitGmSubview(const std::string &param, const PrimExpr &ix, int64_t n,
                      const std::string &name) {
     const auto *mul = ix.as<MulNode>();
@@ -622,18 +724,32 @@ private:
                        "` (expected blockIdx * per-block extent)");
     }
     int64_t stride = 0;
-    bool saw_block = false;
+    const VarNode *block = nullptr;
     for (const PrimExpr *side : {&mul->a, &mul->b}) {
       if (auto v = side->as<IntImmNode>()) {
         stride = v->value;
-      } else if (side->as<VarNode>() != nullptr) {
-        saw_block = true;
+      } else if (const auto *var = side->as<VarNode>()) {
+        if (block != nullptr) {
+          Fail(scope_, "GM offset `" + Show(ix) +
+                           "` (two non-constant factors)");
+        }
+        block = var;
       } else {
         Fail(scope_, "GM offset `" + Show(ix) + "` (non-affine term)");
       }
     }
-    if (!saw_block) {
+    if (block == nullptr) {
       Fail(scope_, "GM offset `" + Show(ix) + "` (no block index)");
+    }
+    // The factor must be THE block variable bound by thread_extent. A different
+    // Var here is a real data-flow change, and emitting it as `get_block_idx`
+    // would make the mutated module indistinguishable from the frozen one.
+    if (block_var_.defined() && !block_var_.same_as(GetRef<Var>(block))) {
+      Fail(scope_, "GM offset `" + Show(ix) + "` (the block factor is `" +
+                       static_cast<std::string>(block->name_hint) +
+                       "`, not the `" +
+                       static_cast<std::string>(block_var_->name_hint) +
+                       "` bound by thread_extent)");
     }
     if (stride != kPerBlockElements) {
       Fail(scope_, "GM block stride " + std::to_string(stride) +
@@ -641,11 +757,15 @@ private:
                        std::to_string(kPerBlockElements) +
                        " elements per block)");
     }
+    if (!block_index_emitted_) {
+      Indent();
+      out_ << "%bx = hivm.hir.get_block_idx -> i64\n";
+      block_index_ = GetRef<Var>(block);
+      block_index_emitted_ = true;
+    }
     Indent();
-    out_ << "%" << name << "_bid = hivm.hir.get_block_idx -> i64\n";
-    Indent();
-    out_ << "%" << name << "_off = arith.muli %" << name << "_bid, %"
-         << BlockStrideName() << " : i64\n";
+    out_ << "%" << name << "_off = arith.muli %bx, %" << BlockStrideName()
+         << " : i64\n";
     Indent();
     out_ << "%" << name << "_ix = arith.index_cast %" << name
          << "_off : i64 to index\n";
@@ -767,7 +887,7 @@ private:
           Fail(scope_, "binding of `" + (bop.empty() ? "<non-Op>" : bop) +
                            "` outside the VF loop (only pset is supported)");
         }
-        EmitPset(bc);
+        EmitPset(bc, bind->var.get());
         continue;
       }
       const auto *e = st.as<EvaluateNode>();
@@ -793,7 +913,25 @@ private:
     return text;
   }
 
-  void EmitPset(const CallNode *call) {
+  // `ResolveVectorOperand` maps a TIR operand to the SSA register that carries
+  // it. Every value-producing vector op records its Var -> register pair, so the
+  // consumer is bound to the value the TIR NAMES. An operand that is not a Var
+  // this emitter produced is a refusal: it cannot be honoured.
+  std::string ResolveVectorOperand(const PrimExpr &arg, const std::string &what) {
+    const auto *var = arg.as<VarNode>();
+    if (var == nullptr) {
+      Fail(scope_, what + " `" + Show(arg) +
+                       "` (expected a bound vector value)");
+    }
+    auto it = reg_by_var_.find(var);
+    if (it == reg_by_var_.end()) {
+      Fail(scope_, what + " `" + static_cast<std::string>(var->name_hint) +
+                       "` (no value was emitted for it)");
+    }
+    return it->second;
+  }
+
+  void EmitPset(const CallNode *call, const VarNode *bound_to = nullptr) {
     const int64_t lanes = Const(call->args[0], "pset pattern length");
     if (lanes != 32) {
       Fail(scope_, "pset pattern length " + std::to_string(lanes) +
@@ -808,6 +946,12 @@ private:
             "#ave.func_dist_type<pb32>} "
             ": vector<"
          << kMaskLanes << "xi1>\n";
+    // The predicate register is nameable by the TIR variable that binds it, so
+    // a consumer's mask operand resolves to THIS definition rather than to a
+    // hard-coded `%mask`.
+    if (bound_to != nullptr) {
+      reg_by_var_[bound_to] = "mask";
+    }
   }
 
   void EmitVfLoop(const For &loop) {
@@ -821,7 +965,21 @@ private:
       Fail(scope_, "VF loop min " + std::to_string(start) +
                        " (the supported subset is 0)");
     }
+    // The step is Optional on tirx.For and defaults to 1. The emitted
+    // `scf.for ... step %c64` walks ELEMENTS one lane at a time and has no way
+    // to express a TIR step, so a step of 2 would emit the unchanged 128-iteration
+    // text for a loop the TIR runs 64 times: a silent change in both iteration
+    // count and covered range. Only the default/one step is representable.
+    if (loop->step.defined()) {
+      const int64_t step = Const(loop->step.value(), "VF loop step");
+      if (step != 1) {
+        Fail(scope_, "VF loop step " + std::to_string(step) +
+                         " (the supported subset is 1; the emitted scf.for walks "
+                         "elements by one lane and cannot express a TIR step)");
+      }
+    }
     loop_var_ = loop->loop_var->name_hint;
+    loop_var_var_ = loop->loop_var;
 
     // The TIR iterates 128 times; the Late form iterates over ELEMENTS. 128 x
     // 64 lanes is the 8192-element tile, so the bound is extent*kLanes and the
@@ -838,9 +996,12 @@ private:
 
     for (const Stmt &st : IterStmts(loop->body)) {
       // `tirx.Bind` binds the vector temporary the next expression consumes;
-      // the bound value IS the computation, so it is emitted in place.
+      // the bound value IS the computation, so it is emitted in place. The Var
+      // is recorded against the register the value landed in, so a consumer
+      // (vadd / vsts) can be checked against the operand the TIR names rather
+      // than against the emission order.
       if (const auto *bind = st.as<BindNode>()) {
-        EmitVfValue(bind->value);
+        EmitVfValue(bind->value, bind->var.get());
         continue;
       }
       const auto *e = st.as<EvaluateNode>();
@@ -848,38 +1009,50 @@ private:
         Fail(scope_, "statement `" + std::string(st->GetTypeKey()) +
                          "` in the VF loop");
       }
-      EmitVfValue(e->value);
+      EmitVfValue(e->value, nullptr);
     }
 
     depth_ -= 1;
     Indent();
     out_ << "}\n";
     loop_var_.clear();
+    loop_var_var_ = Var();
   }
 
   // A vector value: vld (produces a register), vadd (consumes two), vsts
   // (consumes one). Registers are tracked as a stack in program order, which is
   // the SSA order the emitted text uses.
-  void EmitVfValue(const PrimExpr &expr) {
+  void EmitVfValue(const PrimExpr &expr, const VarNode *bound_to) {
     const auto *call = expr.as<CallNode>();
     if (call == nullptr) {
       Fail(scope_, "vector value `" + std::string(expr->GetTypeKey()) + "`");
     }
     const std::string op = OpName(call);
+    std::string produced;
     if (op == kOpVld) {
-      EmitVld(call);
+      produced = EmitVld(call);
     } else if (op == kOpVadd) {
-      EmitVadd(call);
+      produced = EmitVadd(call);
     } else if (op == kOpVsts) {
       EmitVsts(call);
     } else if (op == kOpPset) {
-      EmitPset(call);
+      EmitPset(call, bound_to);
     } else {
       Fail(scope_, "call `" + (op.empty() ? "<non-Op>" : op) + "` in the VF");
     }
+    // A value-producing call bound to a name becomes resolvable by that name.
+    // pset already recorded itself (its register is the predicate `%mask`), so
+    // it is excluded here rather than recorded twice. vsts produces nothing, and
+    // binding it would leave a TIR name no emitted value corresponds to.
+    if (bound_to != nullptr && op != kOpPset) {
+      if (produced.empty()) {
+        Fail(scope_, "a binding of `" + op + "`, which produces no value");
+      }
+      reg_by_var_[bound_to] = produced;
+    }
   }
 
-  void EmitVld(const CallNode *call) {
+  std::string EmitVld(const CallNode *call) {
     if (call->args.size() != 2) {
       Fail(scope_, "vld with " + std::to_string(call->args.size()) +
                        " arguments (expected 2)");
@@ -889,8 +1062,11 @@ private:
     if (mode != "NORM") {
       Fail(scope_, "vld mode `" + mode + "` (the supported subset is NORM)");
     }
+    // require_iteration=true: see ElemBase. A constant vld address would emit the
+    // unchanged per-iteration subview and describe a different program.
     const int64_t byte_off =
-        ElemBase(src.index, "vld UB offset") * DtypeBytes(DataType::Float(32));
+        ElemBase(src.index, "vld UB offset", /*require_iteration=*/true) *
+        DtypeBytes(DataType::Float(32));
     const std::string view = EmitVfSlotView(byte_off, "vld");
     const std::string reg = "v" + std::to_string(reg_count_);
     Indent();
@@ -901,20 +1077,35 @@ private:
          << kLanes << "xf32>\n";
     regs_.push_back(reg);
     ++reg_count_;
+    return reg;
   }
 
-  void EmitVadd(const CallNode *call) {
+  std::string EmitVadd(const CallNode *call) {
     if (call->args.size() != 4) {
       Fail(scope_, "vadd with " + std::to_string(call->args.size()) +
                        " arguments (expected 4)");
     }
-    if (regs_.size() < 2) {
-      Fail(scope_, "vadd without two vector operands in scope");
-    }
-    const std::string rhs = regs_.back();
-    regs_.pop_back();
-    const std::string lhs = regs_.back();
-    regs_.pop_back();
+    // The two operands are taken from the CALL, in the call's order. For the
+    // frozen shape they coincide with "the last two loads", which is precisely
+    // why the difference is invisible until the data flow changes: a vadd over
+    // (a, a) -- or over a register that is NOT the latest load -- would
+    // otherwise emit `vload a; vload b; vadd v0, v1` and silently describe a
+    // different program than the TIR.
+    //
+    // Note the operand ORDER alone is not a numerical mutation: VADD is
+    // commutative, so `vadd(b, a)` computes the same result as `vadd(a, b)`.
+    // Swapping operands is therefore a textual difference, not a semantic one,
+    // and the regression tests use `vadd(a, a)` (or a store bound to a load
+    // other than the latest) for the data-flow cases.
+    const std::string lhs = ResolveVectorOperand(call->args[0], "vadd left operand");
+    const std::string rhs = ResolveVectorOperand(call->args[1], "vadd right operand");
+    // The mask is the CALL's predicate, resolved like any other vector operand.
+    // Emitting the fixed `%mask` here would describe "add under the ALL
+    // predicate" no matter which predicate the TIR passed, so a mutated mask --
+    // e.g. an all-false broadcast, which must zero the result -- would leave the
+    // emitted text unchanged. An operand this emitter produced no value for is
+    // refused by ResolveVectorOperand rather than reinterpreted.
+    const std::string mask = ResolveVectorOperand(call->args[2], "vadd mask");
     const std::string mode = Str(call->args[3], "vadd mask mode");
     if (mode != "MODE_ZEROING") {
       Fail(scope_, "vadd mask mode `" + mode +
@@ -922,11 +1113,12 @@ private:
     }
     const std::string reg = "v" + std::to_string(reg_count_);
     Indent();
-    out_ << "%" << reg << " = ave.hir.vadd %" << lhs << ", %" << rhs
-         << ", %mask : vector<" << kLanes << "xf32>, vector<" << kMaskLanes
+    out_ << "%" << reg << " = ave.hir.vadd %" << lhs << ", %" << rhs << ", %"
+         << mask << " : vector<" << kLanes << "xf32>, vector<" << kMaskLanes
          << "xi1>\n";
     regs_.push_back(reg);
     ++reg_count_;
+    return reg;
   }
 
   void EmitVsts(const CallNode *call) {
@@ -934,23 +1126,26 @@ private:
       Fail(scope_, "vsts with " + std::to_string(call->args.size()) +
                        " arguments (expected 4)");
     }
-    if (regs_.empty()) {
-      Fail(scope_, "vsts without a vector operand in scope");
-    }
-    const std::string val = regs_.back();
-    regs_.pop_back();
+    // Both the stored value and the mask come from the CALL. Reading `regs_`
+    // top-of-stack would store whichever value was emitted last and would use
+    // the one %mask regardless of which predicate the TIR actually passed, so a
+    // changed value or a changed mask would leave the frozen text unchanged.
+    const std::string val = ResolveVectorOperand(call->args[1], "vsts stored value");
+    const std::string mask = ResolveVectorOperand(call->args[2], "vsts mask");
     const Ptr dst = CheckUb(AddressOf(call->args[0], "vsts address"));
     const std::string mode = Str(call->args[3], "vsts store mode");
     if (mode != "NORM_B32") {
       Fail(scope_,
            "vsts mode `" + mode + "` (the supported subset is NORM_B32)");
     }
+    // require_iteration=true: see ElemBase, and the vld case above.
     const int64_t byte_off =
-        ElemBase(dst.index, "vsts UB offset") * DtypeBytes(DataType::Float(32));
+        ElemBase(dst.index, "vsts UB offset", /*require_iteration=*/true) *
+        DtypeBytes(DataType::Float(32));
     const std::string view = EmitVfSlotView(byte_off, "vsts");
     Indent();
-    out_ << "ave.hir.masked_store <NORM_B32> %" << view << "[%c0], %mask, %"
-         << val << " : memref<" << kLanes
+    out_ << "ave.hir.masked_store <NORM_B32> %" << view << "[%c0], %" << mask
+         << ", %" << val << " : memref<" << kLanes
          << "xf32, strided<[1], offset: ?>, #hivm.address_space<ub>>, "
          << "vector<" << kMaskLanes << "xi1>, vector<" << kLanes << "xf32>\n";
   }
@@ -1029,13 +1224,59 @@ private:
   int64_t view_count_ = 0;
   std::string loop_var_;
   std::vector<std::string> regs_;
+  // The blockIdx variable the thread_extent AttrStmt binds, and the ONE SSA name
+  // its `hivm.hir.get_block_idx` result is held in (see EmitGmSubview).
+  //
+  // "Has the op been emitted" is tracked by an explicit flag, NOT by
+  // `Var::defined()`. A default-constructed Var is not a reliable "nothing
+  // emitted yet" sentinel here, and getting it wrong is silent in the worst
+  // way: the definition is skipped while every `%bx` USE is still written, so
+  // the module references an undeclared SSA value and the Late parser rejects
+  // it. That is exactly the failure this flag exists to make impossible.
+  Var block_var_;
+  Var block_index_;
+  bool block_index_emitted_ = false;
+  // The loop variable of the VF loop currently being emitted, for the UB index
+  // validation in LoopTerm.
+  Var loop_var_var_;
+  // TIR variable -> the SSA register holding its emitted value, so a consumer is
+  // bound to the value the TIR names (see ResolveVectorOperand).
+  std::unordered_map<const VarNode *, std::string> reg_by_var_;
 };
 
-std::string EmitLateMlir(const tirx::PrimFunc &func) {
+std::string ResolveKernelSymbol(const tirx::PrimFunc &func,
+                                 const std::string &global_var_name) {
   if (!func.defined()) {
     throw Unsupported("HIVM CodeGen: unsupported an undefined PrimFunc");
   }
-  return Emitter(func).Run();
+  // ONE resolution, used for the emitted `func.func` name, the runtime
+  // FunctionInfo and the provenance label. Resolving it independently in each
+  // place is what lets a function without `global_symbol` emit `main_kernel`
+  // while the runtime metadata is keyed by a differently named GlobalVar: the
+  // build succeeds and the launch lookup then fails on a symbol nobody declared.
+  if (auto s = func->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol)) {
+    const std::string sym = static_cast<std::string>(s.value());
+    if (!sym.empty()) {
+      return sym;
+    }
+  }
+  if (!global_var_name.empty()) {
+    return global_var_name;
+  }
+  throw Unsupported(
+      "HIVM CodeGen: unsupported a device PrimFunc with no 'global_symbol' "
+      "and no GlobalVar name to key the runtime metadata by");
+}
+
+std::string EmitLateMlir(const tirx::PrimFunc &func) {
+  return EmitLateMlir(func, ResolveKernelSymbol(func, ""));
+}
+
+std::string EmitLateMlir(const tirx::PrimFunc &func, const std::string &symbol) {
+  if (!func.defined()) {
+    throw Unsupported("HIVM CodeGen: unsupported an undefined PrimFunc");
+  }
+  return Emitter(func, symbol).Run();
 }
 
 } // namespace hivm

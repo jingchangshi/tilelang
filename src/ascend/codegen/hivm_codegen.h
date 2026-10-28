@@ -27,6 +27,17 @@ namespace hivm {
 // module.
 std::string EmitLateMlir(const tirx::PrimFunc &func);
 
+// Emit for an explicitly resolved kernel entry symbol. Callers that also build
+// the runtime metadata MUST use this overload with the same symbol, so the
+// emitted `func.func` name and the FunctionInfo key cannot diverge.
+std::string EmitLateMlir(const tirx::PrimFunc &func, const std::string &symbol);
+
+// The ONE kernel entry symbol: the function's `global_symbol` when it has a
+// non-empty one, otherwise the name of the GlobalVar that binds it. Throws when
+// neither exists, because there is then nothing the runtime could look up.
+std::string ResolveKernelSymbol(const tirx::PrimFunc &func,
+                                const std::string &global_var_name);
+
 } // namespace hivm
 } // namespace codegen
 } // namespace tvm
