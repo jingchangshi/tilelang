@@ -17,11 +17,25 @@ ASCEND_CODEGEN = DeviceCodegen(
     build_without_compile=global_func_device_codegen("target.build.tilelang_ascend_without_compile"),
 )
 
-# HIVM is the TEST_ONLY PREBUILT path: it does NOT run AscendC source codegen,
-# PTO codegen, or HIVM TIR->Late MLIR generation. It loads the frozen P3 binary
-# and validates it. The entry is a distinct global function so that the
-# isolation sentinels can observe it independently (P4-B.1).
+# HIVM is the REAL DeviceCodeGen: it turns the prepared TIR into Late HIVM/AVE
+# MLIR and compiles that text through the P2 Late pipeline.
+#
+#   target.build.tilelang_hivm                generate + compile       (GENERATED)
+#   target.build.tilelang_hivm_source_only_   generate, return a MODULE  (source only)
+#   module
+#
+# The PREBUILT entry (`target.build.tilelang_hivm_prebuilt`) is deliberately NOT
+# reachable from here. It loads the frozen P3 binary and exists only as a
+# TEST_ONLY path that a test calls directly, so a normal `hivm` backend can never
+# select it -- a build failure raises instead of substituting that binary.
+#
+# `build_without_compile` needs a MODULE, not text: `DeviceCodegen.lower` returns
+# the callback's value into a chain that calls `inspect_source()`. The plain
+# `..._source_only` entry returns an `ffi::String`, so it cannot be bound here;
+# the `..._source_only_module` entry wraps the same generated MLIR in a source
+# module without compiling and without touching the frozen binary.
 HIVM_CODEGEN = DeviceCodegen(
     "ascend",
-    build=global_func_device_codegen("target.build.tilelang_hivm_prebuilt"),
+    build=global_func_device_codegen("target.build.tilelang_hivm"),
+    build_without_compile=global_func_device_codegen("target.build.tilelang_hivm_source_only_module"),
 )

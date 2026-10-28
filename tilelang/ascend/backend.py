@@ -53,6 +53,24 @@ def tilelang_callback_ascend_compile(code, target, pass_config=None):
     return aibin
 
 
+def _hivm_compile_callback(mlir, target):
+    """The registered HIVM compile callback.
+
+    It delegates to `tilelang.contrib.hivm`, which owns the compiler discovery,
+    the target consistency check and the failure behaviour. Imported lazily so
+    this module has no import-time dependency on the contribution package.
+
+    It enters through `hivm.hook`, the SAME target-aware entry that an explicit
+    `hivm.register()` installs. Calling `compile_late_mlir` directly here would
+    drop `target` on the floor: the Target is what ties the device this build
+    selected to the device the compile command emits for, so bypassing it makes
+    the automatic registration weaker than the explicit one for no reason.
+    """
+    from tilelang.contrib import hivm
+
+    return hivm.hook(mlir, target)
+
+
 # Plain Ascend and PTO share the "ascend" target kind, so each is its own
 # BackendModule with a mutually exclusive `supports_target` predicate; the
 # resolver then selects exactly one. Both reuse the same lowering pipeline.
@@ -81,16 +99,24 @@ PTO_BACKEND = register_backend(
     )
 )
 
-# The TEST_ONLY PREBUILT HIVM backend. It shares the "ascend" target kind and
-# is selected by the "hivm" key; its pipeline and device-codegen mappings stay
-# keyed by "ascend", and it reuses the existing host codegens. It opens
-# tvm_ffi only (goal req 9) and runs no AscendC/PTO/HIVM-MLIR codegen.
+# The HIVM backend. It shares the "ascend" target kind and is selected by the
+# "hivm" key; its pipeline and device-codegen mappings stay keyed by "ascend",
+# and it reuses the existing host codegens. It opens tvm_ffi only (goal req 9)
+# and runs no AscendC/PTO codegen.
 #
-# cache_reusable=False (BC-1): this backend injects a device binary read from a
-# fixed PATH at build time, so a warm kernel-cache entry describes TIR that is
-# still correct while the injected bytes may have changed. The cache key does
-# not cover those bytes, so reuse is refused rather than trusted. Every other
-# backend keeps the default True.
+# Its device codegen is the GENERATED one (see codegen.HIVM_CODEGEN): the TIR is
+# turned into Late HIVM/AVE MLIR and compiled by the P2 Late pipeline. The
+# TEST_ONLY PREBUILT entry is deliberately absent from this manifest, so a
+# normal `hivm` build can never select it.
+#
+# cache_reusable=False (BC-1). The original reason was the PREBUILT entry
+# injecting a binary read from a fixed PATH. The reason still holds for the
+# GENERATED path, for a different cause: the cache key hashes the TIR, target,
+# backend, pass configs and flags, but NOT the compiler or the template bitcode
+# the device binary is actually derived from. A warm entry would therefore
+# describe a binary this build never produced and could not audit. goal P5 §6.3
+# keeps the HIVM kernel cache disabled for exactly this phase, so reuse is
+# refused rather than trusted. Every other backend keeps the default True.
 HIVM_BACKEND = register_backend(
     BackendModule(
         name="hivm",
@@ -101,5 +127,12 @@ HIVM_BACKEND = register_backend(
         execution_backends=execution_backend.HIVM_EXECUTION_BACKENDS,
         host_codegens=STANDARD_HOST_CODEGENS,
         cache_reusable=False,
+        # Registering the compile callback here is what makes a plain
+        # `target="hivm"` build work without the caller having to import and
+        # call `tilelang.contrib.hivm.register()` first. The callback resolves
+        # the compiler from HIVM_COMPILER at call time, so registering it has no
+        # effect on a host with no compiler: only the build entry fails, with a
+        # reason naming the variable.
+        callbacks={"tilelang_callback_hivm_compile": _hivm_compile_callback},
     )
 )
